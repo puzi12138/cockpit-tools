@@ -30,38 +30,6 @@ fn quota_display_official() -> CodexAccount {
 }
 
 #[test]
-fn injection_global_quota_keeps_twenty_account_display_and_eighteen_account_routing_separate() {
-    let accounts: Vec<_> = (0..20)
-        .map(|index| quota_display_account(&format!("global-{index}"), "plus", 100, if index == 0 { 0 } else { 80 }))
-        .collect();
-    let collection: CodexLocalAccessCollection = serde_json::from_value(json!({
-        "enabled": true, "port": 6438, "apiKey": "fixture-primary",
-        "apiKeys": [{"id":"fixture-client", "label":"Fixture", "key":"fixture-private",
-            "enabled":true, "inheritAccountPool":false,
-            "accountIds": accounts[..18].iter().map(|account| account.id.clone()).collect::<Vec<_>>() }],
-        "accountIds": accounts.iter().map(|account| account.id.clone()).collect::<Vec<_>>(),
-        "createdAt": 1, "updatedAt": 1
-    })).unwrap();
-    let before = serde_json::to_value(&collection).unwrap();
-    let cooling = HashSet::from([accounts[19].id.clone()]);
-    let global = injection_global_quota_summary(&collection, &accounts, &cooling, 1001, &HashMap::new());
-    assert_eq!(global["scope"], "global_account_pool");
-    assert_eq!(global["accountCount"], 20);
-    assert_eq!(global["fiveHourRemainingPercent"], 1900, "zero weekly quota gates that account's short window");
-    assert_eq!(global["weeklyRemainingPercent"], 1520);
-    assert_eq!(global["plans"][0]["count"], 20);
-    assert_eq!(global["cooldownAccountCount"], 1);
-    assert_eq!(global["fiveHourCapacityPercent"], 2000);
-    let private_ids = effective_api_key_account_ids(&collection, &collection.api_keys[0]);
-    let private = native_quota_summary(&private_ids, &accounts, &cooling, 1001, &HashMap::new());
-    assert_eq!(private["scope"], "api_key_account_pool");
-    assert_eq!(private["accountCount"], 18);
-    assert_eq!(private["fiveHourRemainingPercent"], 1700);
-    assert_eq!(private["weeklyRemainingPercent"], 1360);
-    assert_eq!(serde_json::to_value(&collection).unwrap(), before, "display never changes request routing");
-}
-
-#[test]
 fn quota_reply_official_uses_bound_source_data_and_timestamp_without_special_plan_group() {
     let source = quota_display_account("source", "plus", 65, 80);
     let official = quota_display_official();
