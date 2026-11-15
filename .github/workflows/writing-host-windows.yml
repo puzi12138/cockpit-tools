@@ -1,0 +1,97 @@
+name: "Windows validation build (1.4.0 writing host)"
+
+on:
+  push:
+    branches:
+      - "build/writing-host-1400"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: writing-host-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-result-tests:
+    name: "Host-result regression tests"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libnm-dev patchelf
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run host-result regression tests
+        run: |
+          cargo test --locked -p cockpit-tools --lib agent_browser_host_
+          cargo test --locked -p cockpit-tools --lib writing_block_host_result_replays_losslessly_with_real_tool_calls
+          cargo test --locked -p cockpit-tools --lib agent_browser_checkpoint_with_pending_custom_call_rebuilds_result_only_delta_on_b
+
+  build-windows:
+    name: "Windows Tauri executable"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_PANIC: abort
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Build Tauri application without bundle
+        run: npm run tauri build -- --no-bundle --ci -- --locked
+      - name: Record executable provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse HEAD).Trim()
+          if ($commit -ne $env:GITHUB_SHA) { throw 'Checkout does not match workflow commit.' }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked files changed during build.' }
+          $exe = Resolve-Path 'target/release/cockpit-tools.exe'
+          New-Item -ItemType Directory -Path artifact | Out-Null
+          Copy-Item -LiteralPath $exe -Destination 'artifact/cockpit-tools.exe'
+          $metadata = [ordered]@{
+            commit = $commit
+            tree = (git rev-parse 'HEAD^{tree}').Trim()
+            file = 'cockpit-tools.exe'
+            sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = (Get-Item -LiteralPath $exe).Length
+            rust = (rustc --version)
+            build = 'npm run tauri build -- --no-bundle --ci -- --locked'
+            profile = 'release; opt-level=0, debug=0, lto=false, codegen-units=256, incremental=false, panic=abort'
+          }
+          $metadata | ConvertTo-Json | Set-Content -Path 'artifact/provenance.json' -Encoding utf8
+      - name: Upload executable and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-1.4.0-writing-host-windows
+          path: artifact/
+          retention-days: 7
+          if-no-files-found: error
