@@ -1016,6 +1016,7 @@ async fn fetch_quota(
         return Some(QuotaResponse { remote: serde_json::to_value(remote).ok(), ..Default::default() });
     }
     let url = local_quota_url(&gateway.base_url)?;
+    let port = reqwest::Url::parse(&url).ok()?.port_or_known_default()?;
     let response = client
         .get(url)
         .bearer_auth(&gateway.api_key)
@@ -1026,11 +1027,23 @@ async fn fetch_quota(
     if !response.status().is_success() {
         return None;
     }
-    response
+    let scoped_quota = response
         .json::<QuotaResponse>()
         .await
         .ok()
-        .map(QuotaResponse::normalize_empty_pool)
+        .map(QuotaResponse::normalize_empty_pool)?;
+    // Keep the existing authenticated local request as the ownership check.
+    // Only the matching local service receives the complete display pool.
+    match codex_local_access::injection_global_quota(port).await {
+        Ok(Some(value)) => serde_json::from_value::<QuotaResponse>(value)
+            .ok()
+            .map(QuotaResponse::normalize_empty_pool),
+        Ok(None) => Some(scoped_quota),
+        Err(error) => {
+            logger::log_warn(&format!("[Codex App Injection] 全局额度快照读取失败: {}", error));
+            None
+        }
+    }
 }
 
 /// 查询绑定账号的 DeepSeek 余额；失败时保留上一次的有效快照，不清空已显示的额度。

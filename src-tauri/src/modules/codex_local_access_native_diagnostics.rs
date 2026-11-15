@@ -257,6 +257,85 @@ fn native_scoped_reset_ids(
     Ok(selected)
 }
 
+/// Read the complete local service pool for the Codex app status display only.
+/// The management endpoint and request routing remain scoped to the API key.
+/// A mismatched port is not this service and must retain the original response.
+pub(crate) async fn injection_global_quota(port: u16) -> Result<Option<Value>, String> {
+    let (collection, cooling) = {
+        let runtime = gateway_runtime().lock().await;
+        let Some(collection) = runtime.collection.as_ref() else {
+            return Ok(None);
+        };
+        if !runtime.running || collection.port != port || runtime.actual_port != Some(port) {
+            return Ok(None);
+        }
+        let health = build_account_health_snapshot(&runtime);
+        let cooling: HashSet<String> = health.into_iter()
+            .filter(|item| !item.cooldowns.is_empty() || item.scheduler_available == Some(false))
+            .map(|item| item.account_id)
+            .collect();
+        (collection.clone(), cooling)
+    };
+
+    let scope = collection.account_ids.clone();
+    // Do not filter through routing: paused or otherwise unavailable accounts
+    // still contribute their last observed allowance to the pool display.
+    let scope_to_read = scope.clone();
+    let permit = NATIVE_ACCOUNT_IO.clone().acquire_owned().await
+        .map_err(|_| "Account reader is unavailable".to_string())?;
+    let accounts = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let data_dir = injection_global_quota_data_dir()?;
+        scope_to_read.iter()
+            .map(|id| injection_display_read_account(&data_dir, id)
+                .ok_or_else(|| "Cannot read all global quota accounts".to_string()))
+            .collect::<Result<Vec<_>, String>>()
+    }).await.map_err(|_| "Cannot read the global quota accounts".to_string())??;
+    let mut official_plans = official_quota_plans::load(&accounts).await;
+    for source in &accounts {
+        if collection.official_account_bindings.contains_key(&source.id) {
+            official_plans.insert(source.id.clone(), official_quota_plans::DisplayAccount::from_source(source));
+        }
+    }
+    Ok(Some(injection_global_quota_summary(
+        &collection,
+        &accounts,
+        &cooling,
+        chrono::Utc::now().timestamp(),
+        &official_plans,
+    )))
+}
+
+fn injection_global_quota_summary(
+    collection: &CodexLocalAccessCollection,
+    accounts: &[CodexAccount],
+    cooling: &HashSet<String>,
+    now: i64,
+    official_plans: &HashMap<String, official_quota_plans::DisplayAccount>,
+) -> Value {
+    let mut summary = native_quota_summary(
+        &collection.account_ids, accounts, cooling, now, official_plans,
+    );
+    summary["scope"] = json!("global_account_pool");
+    summary
+}
+
+fn injection_global_quota_data_dir() -> Result<PathBuf, String> {
+    // Match account::get_data_dir's overrides without creating a directory.
+    for key in ["COCKPIT_TOOLS_TEST_DATA_DIR", "COCKPIT_TEST_DATA_DIR", "COCKPIT_TOOLS_DATA_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(PathBuf::from(value));
+            }
+        }
+    }
+    #[cfg(test)]
+    { Ok(crate::modules::test_support::fallback_data_dir()) }
+    #[cfg(not(test))]
+    { account::resolve_data_dir() }
+}
+
 async fn native_management(
     bridge: &NativeHostBridge,
     caller: &native_contract::Caller,
