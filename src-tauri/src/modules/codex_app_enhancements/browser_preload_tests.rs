@@ -409,9 +409,23 @@ async fn verified_configuration_change_replaces_script_and_detached_session_is_n
     mock.event
         .send(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"page"}}))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Events on this mock's websocket are ordered. An unsupported target is
+    // detached by the browser loop only after it consumed the earlier page
+    // detachment, providing an observable barrier instead of a timing guess.
+    mock.event
+        .send(attached("barrier-worker", "worker", "app://-/index.html", false))
+        .unwrap();
+    let barriers = wait_for(&mock, "Target.detachFromTarget", 1).await;
+    assert_eq!(barriers[0]["params"]["sessionId"], "barrier-worker");
     source.send(Some("verified-three".into())).unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // A second unsupported target lets us observe progress after the change.
+    // The source watch branch is prioritized ahead of websocket messages, so
+    // receipt of this command establishes that the source was processed too.
+    mock.event
+        .send(attached("after-change-worker", "worker", "app://-/index.html", false))
+        .unwrap();
+    let barriers = wait_for(&mock, "Target.detachFromTarget", 2).await;
+    assert_eq!(barriers[1]["params"]["sessionId"], "after-change-worker");
     assert_eq!(
         mock.commands
             .lock()
