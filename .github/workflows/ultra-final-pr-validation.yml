@@ -1,0 +1,116 @@
+name: "Ultra final PR candidate validation"
+
+on:
+  push:
+    branches:
+      - "build/ultra-final-pr-validation-20261118"
+
+permissions:
+  contents: read
+
+env:
+  TEST_SOURCE_SHA: "d514d10c2719dd02b9349671451478b4569a8abb"
+
+jobs:
+  enhancement-tests:
+    name: "JavaScript and Rust enhancement tests"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Check out exact source candidate
+        uses: actions/checkout@v4
+        with:
+          ref: "d514d10c2719dd02b9349671451478b4569a8abb"
+          persist-credentials: false
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = "$TEST_SOURCE_SHA"
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libnm-dev patchelf
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Run JavaScript enhancement tests
+        run: node --experimental-vm-modules --test src-tauri/src/modules/codex_app_enhancements/*.test.cjs
+      - name: Run Rust enhancement tests
+        run: cargo test --locked -p cockpit-tools --lib codex_app_enhancements
+
+  build-windows:
+    name: "Windows Tauri executable"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_PANIC: abort
+    steps:
+      - name: Check out exact source candidate
+        uses: actions/checkout@v4
+        with:
+          ref: "d514d10c2719dd02b9349671451478b4569a8abb"
+          persist-credentials: false
+      - name: Verify source identity
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:TEST_SOURCE_SHA) { throw 'Source checkout does not match the pinned candidate.' }
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Build Tauri application without bundle
+        run: npm run tauri build -- --no-bundle --ci -- --locked
+      - name: Record executable provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = (git rev-parse HEAD).Trim()
+          if ($source -ne $env:TEST_SOURCE_SHA) { throw 'Source checkout changed during build.' }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked source files changed during build.' }
+          $exe = Resolve-Path 'target/release/cockpit-tools.exe'
+          New-Item -ItemType Directory -Path artifact | Out-Null
+          Copy-Item -LiteralPath $exe -Destination 'artifact/cockpit-tools.exe'
+          $metadata = [ordered]@{
+            workflow_commit = $env:GITHUB_SHA
+            workflow_ref = $env:GITHUB_REF
+            source_commit = $source
+            source_tree = (git rev-parse 'HEAD^{tree}').Trim()
+            file = 'cockpit-tools.exe'
+            sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = (Get-Item -LiteralPath $exe).Length
+            rust = (rustc --version)
+            build = 'npm run tauri build -- --no-bundle --ci -- --locked'
+            profile = 'release; opt-level=0, debug=0, lto=false, codegen-units=256, incremental=false, panic=abort'
+          }
+          $metadata | ConvertTo-Json | Set-Content -Path 'artifact/provenance.json' -Encoding utf8
+      - name: Upload validation artifact and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-ultra-final-pr-validation-windows
+          path: artifact/
+          retention-days: 7
+          if-no-files-found: error
